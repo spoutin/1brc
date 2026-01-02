@@ -1,129 +1,80 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
-	"strconv"
-	"strings"
+	"runtime"
 	"sync"
 )
 
-type Cities sync.Map
-
-var (
-	readChan = make(chan string, 100)
-)
-
 type Measurement struct {
-	mu  sync.Mutex
-	min float32
-	max float32
-	avg float32
+	min float64
+	max float64
 	cnt int
+	sum float64
+}
+
+func (m *Measurement) Average() float64 {
+	return m.sum / float64(m.cnt)
 }
 
 func (m *Measurement) String() string {
-	return fmt.Sprintf("%f,%f,%f", m.min, m.max, m.avg)
+	return fmt.Sprintf("Min: %f, Max: %f, Avg: %f", m.min, m.max, m.Average())
 }
 
-func (m *Measurement) AddNewData(temp float32) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if temp > m.max {
-		m.max = temp
-	}
-	if temp < m.min {
-		m.min = temp
-	}
-	m.cnt++
-	// Calculate avg without storing all values
-	// Avg = Old Avg + (New Value - Old Avg) / New Count
-	m.avg = (m.avg + (temp - m.avg)) / float32(m.cnt)
-}
-
-func startReader(measurementFile string, startLine, endLine int, readChan chan string) {
-	file, err := os.Open(measurementFile)
-	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-
-	currentLine := startLine
-	slog.Info(fmt.Sprintf("Starting reader for %d", currentLine))
-	for scanner.Scan() {
-		if currentLine >= startLine && currentLine <= endLine {
-			readChan <- scanner.Text()
-		} else if currentLine > endLine {
-			// Stop reading
-			break
-		}
-		currentLine++
-	}
-}
-
-func worker(cities *sync.Map, readChan chan string, closeChan chan bool) {
-	for {
-		select {
-		case <-closeChan:
-			return
-		case data := <-readChan:
-			measurement := strings.Split(data, ";")
-			f, err := strconv.ParseFloat(measurement[1], 32)
-			if err != nil {
-				panic(err)
-			}
-			if d, loaded := cities.LoadOrStore(measurement[0], &Measurement{
-				min: float32(f),
-				max: float32(f),
-				avg: float32(f),
-				cnt: 1,
-			}); loaded {
-				d.(*Measurement).AddNewData(float32(f))
-			}
+func Extent(mu *sync.Mutex, original map[string]Measurement, new map[string]*Measurement) {
+	mu.Lock()
+	defer mu.Unlock()
+	for key, value := range new {
+		if ci, ok := original[key]; ok {
+			ci.Sum(*value)
+		} else {
+			original[key] = *value
 		}
 	}
 }
 
 func main() {
 	measurementFile := flag.String("i", "", "input file")
+	threadCount := flag.Int64("t", int64(runtime.NumCPU()), "number of threads")
 	flag.Parse()
 	if *measurementFile == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
-	closeChannel := make(chan bool)
-	var cities sync.Map
-	wg := new(sync.WaitGroup)
-	wgReader := new(sync.WaitGroup)
-	defer close(readChan)
-	for i := 0; i < 10; i++ {
-		wgReader.Add(1)
-		go func() {
-			defer wgReader.Done()
-			startReader(*measurementFile, i*1_000_000+i, (i*1_000_000)+1_0000_000, readChan)
-		}()
+
+	file, err := os.Open(*measurementFile)
+	fileStat, err := file.Stat()
+	if err != nil {
+		panic(err)
 	}
-	for i := 0; i < 10; i++ {
+	fileSize := fileStat.Size()
+	chuckSize := fileSize / *threadCount
+
+	wg := &sync.WaitGroup{}
+	mu := &sync.Mutex{}
+	cities := make(map[string]Measurement, 10_000)
+	for i := int64(0); i < *threadCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(&cities, readChan, closeChannel)
+			m := readFile(*measurementFile, chuckSize*i, (chuckSize*i)+chuckSize)
+			Extent(mu, cities, m)
 		}()
 	}
-	wgReader.Wait()
-	close(closeChannel) // Add Readers are complete
+	// Get last chuck
+	wg.Add(1)
+	func() {
+		defer wg.Done()
+		m := readFile(*measurementFile, (chuckSize**threadCount)-1, fileStat.Size()-1)
+		Extent(mu, cities, m)
+	}()
+
 	wg.Wait()
-	cities.Range(func(key, value interface{}) bool {
-		fmt.Printf("city %s, min: %f, max: %f, avg: %f, count: %d\n",
-			key, value.(*Measurement).min,
-			value.(*Measurement).min,
-			value.(*Measurement).max,
-			value.(*Measurement).cnt,
-		)
-		return true
-	})
+
+	for city, measurement := range cities {
+		fmt.Printf("%s - %s\n", city, measurement.String())
+	}
+
 }
